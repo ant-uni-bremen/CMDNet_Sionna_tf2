@@ -7,7 +7,7 @@ You can find the original source code [here](https://github.com/ant-uni-bremen/C
 
 # Usage
 
-Choose an example test script in `cmdnet_sionna_tf2.py` by setting variable, e.g., `example = 0`:
+Choose an example test script in `cmdnet_sionna_tf2.py` by setting variable, e.g., `EXAMPLE = 0`:
 
 ### Scenarios
 0. CMDNet QPSK 64x64

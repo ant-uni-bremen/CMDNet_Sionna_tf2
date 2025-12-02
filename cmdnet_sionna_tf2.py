@@ -55,7 +55,7 @@ except ImportError as e:
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 GLOBAL_PRECISION = 'float32'
-print(GLOBAL_PRECISION)
+print('Selected precision: ' + GLOBAL_PRECISION)
 sn.config.xla_compat = True
 
 
@@ -957,7 +957,7 @@ def conventional_training(model, num_training_iterations, training_batch_size, e
             start_time2 = time.time()
 
 
-def script1():
+def script1(max_mc_iter=1000, num_target_block_errors=100, batch_size=10020):
     '''All CMDNet curves from the journal article for dimension 32x32 (effective dimension: 64x64)
     '''
     ber_plot = PlotBER()
@@ -973,9 +973,9 @@ def script1():
     snr_range = np.arange(1, 18, 1)  # [1, 13, 1], [1, 31, 1], [-3, 16, 0.5]
     # snr_range = np.arange(1, 12, 1), # -3, 16, 0.5
     # int(10000 / (model1.num_tx_ant * model1.num_tx_ant / 4)), # 4096
-    batch_size = 10020
-    max_mc_iter = 10  # 1000
-    num_target_block_errors = 100
+    # batch_size = 10020
+    # max_mc_iter = 10  # 1000
+    # num_target_block_errors = 100
 
     # Load starting point
     algo0 = algo_mmse(constellation)
@@ -983,9 +983,9 @@ def script1():
     algo2 = algo_amp(Nit, constellation, num_tx_ant, binary=True)
 
     if GLOBAL_PRECISION == 'float64':
-        sub_folder = 'data_cmd_sionna' + '_float64'
+        sub_folder = 'data_cmdnet_sionna' + '_float64'
     else:
-        sub_folder = 'data_cmd_sionna'
+        sub_folder = 'data_cmdnet_sionna'
     # Old weight loading
     # saveobj2 = mf.savemodule('npz')
     # train_hist2 = mf.training_history()
@@ -1123,7 +1123,7 @@ def script1():
     tplt.save('plots/cmdnet_sionna_script1_QAM4_64x64.tikz')
 
 
-def script2():
+def script2(max_mc_iter=1000, num_target_block_errors=100, batch_size=10020):
     '''All CMDNet curves from the journal article for dimension 8x8 (effective dimension: 16x16)
     '''
     ber_plot = PlotBER()
@@ -1139,9 +1139,9 @@ def script2():
     snr_range = np.arange(1, 16, 1)  # [1, 13, 1], [1, 31, 1], [-3, 16, 0.5]
     # snr_range = np.arange(1, 12, 1), # -3, 16, 0.5
     # int(10000 / (model1.num_tx_ant * model1.num_tx_ant / 4)), # 4096
-    batch_size = 10020
-    max_mc_iter = 100  # 1000
-    num_target_block_errors = 100
+    # batch_size = 10020
+    # max_mc_iter = 100  # 1000
+    # num_target_block_errors = 100
 
     # Load starting point
     algo0 = algo_mmse(constellation)
@@ -1202,7 +1202,7 @@ def script2():
     tplt.save('plots/cmdnet_sionna_script2_QAM4_16x16.tikz')
 
 
-def script3():
+def script3(max_mc_iter=1000, num_target_block_errors=1000, batch_size=10020):
     '''All CMDNet curves from the journal article for QAM16 modulation dimension 32x32 (effective 4-ASK modulation and dimension: 64x64)
     '''
     ber_plot = PlotBER()
@@ -1216,18 +1216,18 @@ def script3():
     constellation = Constellation(mod, num_bits_per_symbol, trainable=False)
     # Test params
     snr_range = np.arange(6, 31, 1)
-    batch_size = 10020
-    max_mc_iter = 100  # 1000
-    num_target_block_errors = 1000
+    # batch_size = 10020
+    # max_mc_iter = 100  # 1000
+    # num_target_block_errors = 1000
 
     # Load starting point
     algo0 = algo_mmse(constellation)
     algo1 = algo_amp(Nit, constellation, num_tx_ant)
 
     if GLOBAL_PRECISION == 'float64':
-        sub_folder = 'data_cmd_sionna' + '_float64'
+        sub_folder = 'data_cmdnet_sionna' + '_float64'
     else:
-        sub_folder = 'data_cmd_sionna'
+        sub_folder = 'data_cmdnet_sionna'
 
     # , taui0 = taui0, delta0 = delta0)
     algo2 = algo_cmdnet(Nit, constellation, num_tx_ant)
@@ -1270,10 +1270,10 @@ def script3():
     tplt.save('plots/cmdnet_sionna_script3_QAM16_64x64.tikz')
 
 
-def script4():
+def script4(max_mc_iter=100, num_target_block_errors=100, batch_size=10):
     '''All CMDNet curves with code from the journal article for QPSK modulation and dimension 32x32 (effective BPSK modulation and dimension: 64x64)
-    TODO: Somehow CMDNet with code does not work here...
     Idea: Try using with old BP implementation -> no change -> problem lies within new cmdnet implementation
+    float64 precision required for reproduction, worse results with float32 -> not implementable in Sionna
     '''
     # tf.config.run_functions_eagerly(True)
 
@@ -1289,18 +1289,18 @@ def script4():
     Ncit = 10
     # Test params
     snr_range = np.arange(3, 14, 1)     # np.arange(3, 19, 1)
-    batch_size = 10
-    max_mc_iter = 100  # 100
-    num_target_block_errors = 100  # 1000
+    # batch_size = 10
+    # max_mc_iter = 100  # 100
+    # num_target_block_errors = 100  # 1000
 
     # Load starting point
     algo0 = algo_mmse(constellation)
     algo1 = algo_amp(Nit, constellation, num_tx_ant)
 
     if GLOBAL_PRECISION == 'float64':
-        sub_folder = 'data_cmd_sionna' + '_float64'
+        sub_folder = 'data_cmdnet_sionna' + '_float64'
     else:
-        sub_folder = 'data_cmd_sionna'
+        sub_folder = 'data_cmdnet_sionna'
 
     # , taui0 = taui0, delta0 = delta0)
     algo2 = algo_cmdnet(Nit, constellation, num_tx_ant)
@@ -1360,7 +1360,7 @@ def script4():
     tplt.save('plots/cmdnet_sionna_script4_QAM4_64x64_wcode.tikz')
 
 
-def script5():
+def script5(max_mc_iter=100, num_target_block_errors=100, batch_size=10020):
     '''Exemplary training for binary CMDNet for QPSK modulation and dimension 32x32 (effective BPSK modulation and dimension: 64x64)
     '''
     # tf.config.run_functions_eagerly(True)
@@ -1377,9 +1377,9 @@ def script5():
     # Test params
     ber_plot = PlotBER()
     snr_range = np.arange(1, 18, 1)
-    batch_size = 10020
-    max_mc_iter = 100                   # 100
-    num_target_block_errors = 100       # 100
+    # batch_size = 10020
+    # max_mc_iter = 100                   # 100
+    # num_target_block_errors = 100       # 100
     it_print = 1
 
     # Algorithm and Model
@@ -1388,9 +1388,9 @@ def script5():
     algo1 = algo_cmdnet(Nit, constellation, num_tx_ant,
                         binary=True, taui0=taui0, delta0=delta0)
     if GLOBAL_PRECISION == 'float64':
-        sub_folder = 'data_cmd_sionna' + '_float64'
+        sub_folder = 'data_cmdnet_sionna' + '_float64'
     else:
-        sub_folder = 'data_cmd_sionna'
+        sub_folder = 'data_cmdnet_sionna'
     # Load pretrained weights
     # sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 * num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit,}
     # fn = filename_module(sub_folder, 'weights_', algo1.algo_name, 'binary_tau0.1', sim_set)
@@ -1399,11 +1399,12 @@ def script5():
                                 const=constellation, code=code, trainbit=trainbit)
 
     # Training parameters
-    batch_size = 500                    # w/o code: 1000 -> 500 ?, w code: 10/1
+    # w/o code: 1000 -> 500 ?, w code: 10/1
+    training_batch_size = 500
     train_iter = 100000                 # 100000
     # w/o code: [7, 26], w code: [0, 3] # QAM16: [10, 33]
     ebno_db_train = [4, 27]
-    conventional_training(model1, train_iter, batch_size,
+    conventional_training(model1, train_iter, training_batch_size,
                           ebno_db_train, it_print=it_print)
     # Save after training
     sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
@@ -1452,21 +1453,30 @@ if __name__ == '__main__':
     # os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/home/beck/miniconda3/envs/ml3/lib'
 
     # Choose example test script
-    # -1: Debug
     # 0: CMDNet QPSK 64x64
     # 1: CMDNet QPSK 16x16
     # 2: CMDNet QAM16 64x64
     # 3: CMDNet with code (float 32 precision problem...)
     # 4: Training of CMDNet
-    example = 0
+    EXAMPLE = 1
+    # Simulation parameters
+    max_mc_iter = 100              # 1000 in article, 100 for faster simulations
+    num_target_block_errors = 100  # 1000 in article, 100 for faster simulations
 
-    if example == 0:
-        script1()
-    elif example == 1:
-        script2()
-    elif example == 2:
-        script3()
-    elif example == 3:
-        script4()
-    elif example == 4:
-        script5()
+    if EXAMPLE == 0:
+        script1(max_mc_iter=max_mc_iter,
+                num_target_block_errors=num_target_block_errors)
+    elif EXAMPLE == 1:
+        script2(max_mc_iter=max_mc_iter,
+                num_target_block_errors=num_target_block_errors)
+    elif EXAMPLE == 2:
+        script3(max_mc_iter=max_mc_iter,
+                num_target_block_errors=num_target_block_errors)
+    elif EXAMPLE == 3:
+        script4(max_mc_iter=100,
+                num_target_block_errors=num_target_block_errors, batch_size=10)
+    elif EXAMPLE == 4:
+        script5(max_mc_iter=max_mc_iter,
+                num_target_block_errors=num_target_block_errors)
+    else:
+        print('No test script selected.')
