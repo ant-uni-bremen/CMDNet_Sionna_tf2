@@ -15,7 +15,7 @@ import time
 import tikzplotlib as tplt
 import os
 import numpy as np
-from sionna.fec.ldpc.decoding import LDPC5GDecoder
+from sionna.fec.ldpc.decoding import LDPC5GDecoder, LDPCBPDecoder
 from sionna.fec.ldpc.encoding import LDPC5GEncoder
 from sionna.mapping import SymbolDemapper, Mapper, Demapper, Constellation
 from sionna.mimo import lmmse_equalizer
@@ -24,36 +24,13 @@ from sionna.channel import FlatFadingChannel, KroneckerModel
 from sionna.utils import BinarySource, QAMSource, ebnodb2no, compute_ser, compute_ber, PlotBER
 from sionna.utils.metrics import BitwiseMutualInformation
 import tensorflow as tf
+import matplotlib.pyplot as plt
 import cmdnet_utils as cmd_utils
-# import sys
-# import matplotlib.pyplot as plt
-# from unittest import findTestCases
-# from sklearn.metrics import fowlkes_mallows_score
-# from tensorflow.keras import layers
-# from tensorflow.keras.models import Model
-# from tensorflow.keras import backend as KB
-
-
-# gpus = tf.config.list_physical_devices('GPU')
-# print('Number of GPUs available :', len(gpus))
-# if gpus:
-#     gpu_num = 0  # Number of the GPU to be used
-#     try:
-#         tf.config.set_visible_devices(gpus[gpu_num], 'GPU')
-#         print('Only GPU number', gpu_num, 'used.')
-#         tf.config.experimental.set_memory_growth(gpus[gpu_num], True)
-#     except RuntimeError as e:
-#         print(e)
 
 # Import Sionna
-try:
-    import sionna as sn
-except ImportError as e:
-    # Install Sionna if package is not already installed
-    os.system("pip install sionna")
-    import sionna as sn
-
+import sionna as sn
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+# Sionna only works with float32 precision in version 0.9.0
 GLOBAL_PRECISION = 'float32'
 print('Selected precision: ' + GLOBAL_PRECISION)
 sn.config.xla_compat = True
@@ -61,7 +38,7 @@ sn.config.xla_compat = True
 
 class CommunicationModel(tf.keras.Model):
     def __init__(self, algo, spatial_corr=None, num_tx_ant=32, num_rx_ant=32, const=Constellation('pam', 1),
-                 code=False, n=1024, k=512, code_it=10, code_train=False, trainbit=False):
+                 code=False, n=1024, k=512, code_it=10, code_train=False, trainbit=False, tf1_code=False):
         super().__init__()
         self.num_tx_ant = num_tx_ant
         self.num_rx_ant = num_rx_ant
@@ -79,23 +56,29 @@ class CommunicationModel(tf.keras.Model):
                                          spatial_corr=spatial_corr,
                                          add_awgn=True,
                                          return_channel=True)
+        self.tf1_code = tf1_code
         # self.val_batch_size = 10000
         if self.code is True:
-            self.n = n
-            self.k = k
+            if self.tf1_code:
+                # Original LDPC BP implementation from article
+                file_code = np.load(os.path.join(
+                    'codes', 'LDPC64x128') + '.npz')
+                self.G = file_code['G']
+                self.H = file_code['H']
+                self.n = self.G.shape[1]
+                self.k = self.G.shape[0]
+                self.encoder = cmd_utils.LinearBlockEncoder(self.G)
+                self.decoder = LDPCBPDecoder(
+                    self.H, trainable=code_train, num_iter=code_it, cn_type='boxplus', hard_out=False)
+            else:
+                self.n = n
+                self.k = k
+                self.encoder = LDPC5GEncoder(self.k, self.n)
+                self.decoder = LDPC5GDecoder(self.encoder,
+                                             num_iter=code_it,
+                                             trainable=code_train,
+                                             hard_out=False)
             self.coderate = self.k / self.n
-            self.encoder = LDPC5GEncoder(self.k, self.n)
-            self.decoder = LDPC5GDecoder(self.encoder,
-                                         num_iter=code_it,
-                                         trainable=code_train,
-                                         hard_out=False)
-            # Own BP implementation
-            # saveobj = mf.savemodule('npz')
-            # code = saveobj.load(os.path.join('codes', 'LDPC64x128'))
-            # self.G = code['G']
-            # self.H = code['H']
-            # c = mf.encoder(b, self.G)
-            # [llr_b, c_hat, b_hat] = mf.bp_decoder(llr_c, self.H, 10, 0)
         else:
             self.coderate = 1
     # Training of CMDNet w/o code works as expected if we remove this decorator (?)
@@ -104,18 +87,23 @@ class CommunicationModel(tf.keras.Model):
     def call(self, batch_size, ebno_db, ebno_db_max=None):
 
         # Foward model
-        if self.code is True:
-            b = self.binary_source([batch_size, self.num_tx_ant, self.k])
-            c = self.encoder(b)
-            # Own BP implementation
-            # c = mf.encoder(b, self.G)
+        if self.code:
+            # Encoding: Horizontally coded MIMO as in Massive MIMO uplink
+            # modulation_order = 2 ** (self.num_bits_per_symbol)
+            b = self.binary_source(
+                [batch_size * self.num_tx_ant * self.num_bits_per_symbol, self.k])
+            b0 = tf.reshape(b, [batch_size, self.num_tx_ant,
+                            self.num_bits_per_symbol, self.k])
+            # Original LDPC BP implementation from article
+            # c0 = cmd_utils.encoder(b0, self.G)
+            c0 = self.encoder(b0)
+            c = tf.reshape(tf.transpose(
+                c0, [0, 3, 1, 2]), [-1, c0.shape[1], c0.shape[2]])
         else:
             b = self.binary_source([batch_size, self.num_tx_ant])
             c = b
-        shapec = tf.shape(c)
 
         x = self.mapper(c)
-        # shape = x.shape
         x = tf.reshape(x, [-1, self.num_tx_ant])
 
         if ebno_db_max is None:
@@ -137,21 +125,31 @@ class CommunicationModel(tf.keras.Model):
         # Receiver side
         ft, x_hat, llr_c, p_c = self.algo([y, h, sigmat0])
 
-        llr_c = tf.reshape(llr_c, shapec)
-        p_c = tf.reshape(p_c, shapec)
+        if self.code:
+            # Decoding: Horizontally coded MIMO as in Massive MIMO uplink
+            shapec = [-1, self.n, llr_c.shape[1], llr_c.shape[2]]
+            llr_c2 = tf.reshape(tf.transpose(tf.reshape(llr_c, shapec), [
+                                0, 2, 3, 1]), [-1, self.n])
+            p_c = tf.reshape(tf.transpose(tf.reshape(
+                p_c, shapec), [0, 2, 3, 1]), [-1, self.n])
+        else:
+            shapec = tf.shape(c)
+            llr_c2 = tf.reshape(llr_c, shapec)
+            p_c = tf.reshape(p_c, shapec)
 
-        if self.code is True:
-            llr_b = self.decoder(llr_c)
-            # Own BP implementation
-            # shape_llr = llr_c.shape
-            # llr_c = tf.reshape(llr_c, [-1, 128])
-            # llr_hat, _, _ = mf.bp_decoder(llr_c, self.H, 10, 0)
-            # llr_b = tf.reshape(llr_hat[..., 0:64], [shape_llr[0], shape_llr[1], -1])
-            #
+        if self.code:
+            if self.tf1_code:
+                # Original LDPC BP implementation from article
+                # llr_hat, _, _ = cmd_utils.bp_decoder(llr_c2, self.H, 10, 0)
+                # llr_b = llr_hat[..., 0:self.k]
+                llr_hat = self.decoder(llr_c2)
+                llr_b = llr_hat[..., 0:self.k]
+            else:
+                llr_b = self.decoder(llr_c2)
             symprob2llr = tf_symprob2llr(2, b=1)
             p_b = symprob2llr.llr2prob(llr_b)
         else:
-            llr_b = llr_c
+            llr_b = llr_c2
             p_b = p_c
         b_hat = tf.cast(llr_b > 0, dtype=GLOBAL_PRECISION)
 
@@ -190,7 +188,7 @@ class CommunicationModel(tf.keras.Model):
                     z = tf.one_hot(cl, depth=M)
                     loss = tf.reduce_mean(tf.reduce_mean(
                         tf.keras.losses.categorical_crossentropy(z, ft, axis=-1), axis=-1))
-        return b, b_hat, loss, llr_c, ft
+        return b, b_hat, loss, llr_c2, ft
 
 
 @tf.function  # (jit_compile = True)
@@ -227,10 +225,10 @@ class tf_symprob2llr():
         self.M = M
         self.c_poss = tf_int2bin(np.array(range(0, M)), int(np.log2(M)))
         self.mask = tf.cast((self.c_poss == b)[
-                            np.newaxis, np.newaxis, ...], dtype=GLOBAL_PRECISION)
+            np.newaxis, np.newaxis, ...], dtype=GLOBAL_PRECISION)
     # Instance methods
 
-    @tf.function  # (jit_compile = True)
+    # @tf.function  # (jit_compile = True)
     def __call__(self, p_m):
         '''
         p_m: symbol probability
@@ -238,13 +236,13 @@ class tf_symprob2llr():
         p_c: bit probability of c being b = 0 or b = 1 according to bit reference
         '''
         eps = tf.constant(1e-20, dtype=p_m.dtype)
-        p_c = tf.reduce_sum(p_m[..., tf.newaxis] * self.mask, axis=-2)
+        p_c = tf.reduce_sum(tf.expand_dims(p_m, axis=-1) * self.mask, axis=-2)
         # avoid NaN, -infinity with term above
         llr_c = tf.math.log((p_c + eps) / (1 - p_c + eps))
         llr_c = tf.clip_by_value(llr_c, -1e9, 1e9)   # avoid infinity
         return llr_c, p_c
 
-    @tf.function  # (jit_compile = True)
+    # @tf.function  # (jit_compile = True)
     def llr2prob(self, llr):
         '''
         Convert bit (!) llr into bit probability
@@ -270,30 +268,30 @@ class algo_mmse(tf.keras.Model):
         if self.mod == 'pam':
             self.M = constellation.points.shape[0]
         else:
-            self.M = int(constellation.points.shape[0] / 2)
+            self.M = int(np.log2(constellation.points.shape[0]))
         self.symprob2llr = tf_symprob2llr(self.M, b=1)
 
     @tf.function  # (jit_compile = True)
-    def call(self, inputs):
+    def call(self, inputs, complex_model=2):
         [y, h, sigmat0] = inputs
         no = sigmat0 ** 2
         num_rx_ant = h.shape[-2]
         num_tx_ant = h.shape[-1]
         y_scale = np.sqrt(2 / num_rx_ant)
         if self.mod == 'pam':
+            complex_model = 0
             Ht = y_scale * tf.cast(tf.math.real(h), dtype='complex64')
             yt = y_scale * tf.cast(tf.math.real(y), dtype='complex64')
             s = tf.complex(no[..., tf.newaxis, tf.newaxis] *
                            tf.eye(num_rx_ant, num_rx_ant), 0.0)
         else:
-            compl = 2
-            if compl == 1:
+            if complex_model == 1:
                 # Complex: Version 1
                 Ht = np.sqrt(1 / num_rx_ant) * h
                 yt = np.sqrt(1 / num_rx_ant) * y
                 s = tf.complex(no[..., tf.newaxis, tf.newaxis]
                                * tf.eye(num_rx_ant, num_rx_ant), 0.0)
-            elif compl == 2:
+            elif complex_model == 2:
                 # Complex: Version 2 without scaling
                 no2 = no * num_rx_ant
                 Ht = h
@@ -313,7 +311,7 @@ class algo_mmse(tf.keras.Model):
         x_hat, no_eff = lmmse_equalizer(
             tf.cast(yt, dtype='complex64'), tf.cast(Ht, dtype='complex64'), s)
         # demapper expects complex x_hat normalized w.r.t. Re and Im part (!!!)
-        if self.mod == 'qam' and compl == 0:
+        if self.mod == 'qam' and complex_model == 0:
             x_hat = x_hat[:, :num_tx_ant] + 1j * x_hat[:, num_tx_ant:]
             no_eff = no_eff[:, :num_tx_ant] + no_eff[:, num_tx_ant:]
         # x_hat = tf.reshape(x_hat, shape)
@@ -323,6 +321,15 @@ class algo_mmse(tf.keras.Model):
             [tf.cast(x_hat, dtype='complex64'), tf.cast(no_eff, dtype=GLOBAL_PRECISION)])
         p_c = self.symprob2llr.llr2prob(llr_c)
         ft = []
+        if not self.mod == 'pam':
+            llr_c = tf.expand_dims(llr_c, axis=-1)
+            p_c = tf.expand_dims(p_c, axis=-1)
+            llr_c = tf.reshape(
+                llr_c, [-1, int(llr_c.shape[1] / self.M), self.M])
+            # llr_c = tf.concat([llr_c[..., 0::2], llr_c[..., 1::2]], axis=-1)
+            p_c = tf.reshape(
+                p_c, [-1, int(p_c.shape[1] / self.M), self.M])
+            # p_c = tf.concat([p_c[..., 0::2], p_c[..., 1::2]], axis=-1)
         return ft, x_hat, llr_c, p_c
 
 
@@ -390,15 +397,13 @@ class algo_cmdnet(tf.keras.Model):
         ft, xt = self.cmdnet([yt, Ht, sigmat0])
         llr_c, p_c = self.symprob2llr(ft)
         if not self.mod == 'pam':
-            # llr_c = llr_c[..., tf.newaxis]
-            # p_c = p_c[..., tf.newaxis]
             llr_c = tf.concat(
                 [llr_c[:, :num_tx_ant], llr_c[:, num_tx_ant:]], axis=-1)
             llr_c = tf.concat([llr_c[..., 0::2], llr_c[..., 1::2]], axis=-1)
             p_c = tf.concat(
                 [p_c[:, :num_tx_ant], p_c[:, num_tx_ant:]], axis=-1)
             p_c = tf.concat([p_c[..., 0::2], p_c[..., 1::2]], axis=-1)
-            # ft = tf.reshape(tf.concat([ft[:, :model1.num_tx_ant][..., tf.newaxis], ft[:, model1.num_tx_ant:][..., tf.newaxis]], axis = -1), [-1, ft.shape[1], ft.shape[2]])
+            # ft = tf.reshape(tf.concat([ft[:, :model1_cmdnet.num_tx_ant][..., tf.newaxis], ft[:, model1_cmdnet.num_tx_ant:][..., tf.newaxis]], axis = -1), [-1, ft.shape[1], ft.shape[2]])
         return ft, xt, llr_c, p_c
 
 
@@ -463,15 +468,15 @@ class cmdnet_layer(tf.keras.layers.Layer):
         self.last_iter = last_iter
         self.taui = self.add_weight(shape=(1,),
                                     initializer=tf.keras.initializers.Constant(
-                                        value=taui),
-                                    trainable=True,
-                                    name='taui')
+            value=taui),
+            trainable=True,
+            name='taui')
         if not self.last_iter:
             self.delta = self.add_weight(shape=(1,),
                                          initializer=tf.keras.initializers.Constant(
-                                             value=delta),
-                                         trainable=True,
-                                         name='delta')
+                value=delta),
+                trainable=True,
+                name='delta')
 
     @tf.function  # (jit_compile = True)
     def call(self, G, HH, yH, sigmat):
@@ -574,15 +579,15 @@ class cmdnet_bin_layer(tf.keras.layers.Layer):
         self.last_iter = last_iter
         self.taui = self.add_weight(shape=(1,),
                                     initializer=tf.keras.initializers.Constant(
-                                        value=taui),
-                                    trainable=True,
-                                    name='taui')
+            value=taui),
+            trainable=True,
+            name='taui')
         if not self.last_iter:
             self.delta = self.add_weight(shape=(1,),
                                          initializer=tf.keras.initializers.Constant(
-                                             value=delta),
-                                         trainable=True,
-                                         name='delta')
+                value=delta),
+                trainable=True,
+                name='delta')
 
     @tf.function  # (jit_compile = True)
     def call(self, s, HH, yH, sigmat):
@@ -600,7 +605,7 @@ class cmdnet_bin_layer(tf.keras.layers.Layer):
         #     ft = tf.concat([(1 + xt2) / 2, (1 - xt2) / 2], axis = -1) # [q(x = 1), q(x = -1)]
         # [q(x = m_1), q(x = m_2)]
         ft = tf.concat([(1 + self.m[0] * xt2) / 2,
-                       (1 + self.m[1] * xt2) / 2], axis=-1)
+                        (1 + self.m[1] * xt2) / 2], axis=-1)
 
         if not self.last_iter:
             xHH = tf.squeeze(tf.matmul(tf.expand_dims(xt, axis=1), HH), axis=1)
@@ -626,15 +631,15 @@ class cmdnet_bin_generic_layer(tf.keras.layers.Layer):
         self.last_iter = last_iter
         self.taui = self.add_weight(shape=(1,),
                                     initializer=tf.keras.initializers.Constant(
-                                        value=taui),
-                                    trainable=True,
-                                    name='taui')
+            value=taui),
+            trainable=True,
+            name='taui')
         if not self.last_iter:
             self.delta = self.add_weight(shape=(1,),
                                          initializer=tf.keras.initializers.Constant(
-                                             value=delta),
-                                         trainable=True,
-                                         name='delta')
+                value=delta),
+                trainable=True,
+                name='delta')
 
     @tf.function  # (jit_compile = True)
     def call(self, s, HH, yH, sigmat):
@@ -644,9 +649,9 @@ class cmdnet_bin_generic_layer(tf.keras.layers.Layer):
             ft0 = tf.math.sigmoid(-(tf.math.log(1 / self.alpha - 1) + s) * 1)
         else:
             ft0 = tf.math.sigmoid(-(tf.math.log(1 /
-                                  self.alpha - 1) + s) * taui_abs)
+                                                self.alpha - 1) + s) * taui_abs)
         ft = tf.concat([ft0[..., tf.newaxis], (1 - ft0)
-                       [..., tf.newaxis]], axis=-1)
+                        [..., tf.newaxis]], axis=-1)
         xt = tf.cast(ft0, dtype=GLOBAL_PRECISION) * \
             (self.m[0] - self.m[1]) + self.m[1]
 
@@ -722,7 +727,7 @@ class algo_amp(tf.keras.Model):
             p_c = tf.concat(
                 [p_c[:, :num_tx_ant], p_c[:, num_tx_ant:]], axis=-1)
             p_c = tf.concat([p_c[..., 0::2], p_c[..., 1::2]], axis=-1)
-            # ft = tf.reshape(tf.concat([ft[:, :model1.num_tx_ant][..., tf.newaxis], ft[:, model1.num_tx_ant:][..., tf.newaxis]], axis = -1), [-1, ft.shape[1], ft.shape[2]])
+            # ft = tf.reshape(tf.concat([ft[:, :model1_amp.num_tx_ant][..., tf.newaxis], ft[:, model1_amp.num_tx_ant:][..., tf.newaxis]], axis = -1), [-1, ft.shape[1], ft.shape[2]])
         return ft, xt, llr_c, p_c
 
 
@@ -755,7 +760,7 @@ class amp(tf.keras.Model):
         delta0 = tf.constant(delta0, shape=(num_iter), dtype=GLOBAL_PRECISION)
         # Starting point
         self.s0 = tf.constant(tf.tensordot(alpha, m, axes=1)[
-                              tf.newaxis, :])  # a-priori mean
+            tf.newaxis, :])  # a-priori mean
         self.amp_layer = []
         self.gamma = []
         self.delta = []
@@ -817,15 +822,15 @@ class amp_layer(tf.keras.layers.Layer):
         self.last_iter = last_iter
         self.gamma = self.add_weight(shape=(1,),
                                      initializer=tf.keras.initializers.Constant(
-                                         value=gamma),
-                                     trainable=True,
-                                     name='gamma')
+            value=gamma),
+            trainable=True,
+            name='gamma')
         if not self.last_iter:
             self.delta = self.add_weight(shape=(1,),
                                          initializer=tf.keras.initializers.Constant(
-                                             value=delta),
-                                         trainable=True,
-                                         name='delta')
+                value=delta),
+                trainable=True,
+                name='delta')
 
     @tf.function  # (jit_compile = True)
     def call(self, s, rH, tau, HH, yH, N0, beta):
@@ -862,15 +867,15 @@ class amp_bin_layer(tf.keras.layers.Layer):
         self.last_iter = last_iter
         self.gamma = self.add_weight(shape=(1,),
                                      initializer=tf.keras.initializers.Constant(
-                                         value=gamma),
-                                     trainable=True,
-                                     name='gamma')
+            value=gamma),
+            trainable=True,
+            name='gamma')
         if not self.last_iter:
             self.delta = self.add_weight(shape=(1,),
                                          initializer=tf.keras.initializers.Constant(
-                                             value=delta),
-                                         trainable=True,
-                                         name='delta')
+                value=delta),
+                trainable=True,
+                name='delta')
 
     @tf.function  # (jit_compile = True)
     def call(self, s, rH, tau, HH, yH, N0, beta):
@@ -886,7 +891,7 @@ class amp_bin_layer(tf.keras.layers.Layer):
                 s, axis=-1)), axis=-1) + (tau / (tau_old + 1))[:, tf.newaxis] * rH
 
         w_m = tf.concat([(1 + tf.math.sign(self.mt[..., 0]) * s[..., tf.newaxis]) / 2,
-                        (1 + tf.math.sign(self.mt[..., 1]) * s[..., tf.newaxis]) / 2], axis=-1)
+                         (1 + tf.math.sign(self.mt[..., 1]) * s[..., tf.newaxis]) / 2], axis=-1)
         return s, rH, tau, w_m
 
 
@@ -921,8 +926,8 @@ def conventional_training(model, num_training_iterations, training_batch_size, e
     def train_step(optimizer, training_batch_size, ebno_db_train):
         # Forward pass
         with tf.GradientTape() as tape:
-            b, b_hat, loss, llr_c, ft = model(training_batch_size,
-                                              ebno_db_train[0], ebno_db_train[1])
+            b, b_hat, loss, _, _ = model(training_batch_size,
+                                         ebno_db_train[0], ebno_db_train[1])
         # Computing and applying gradients
         grads = tape.gradient(loss, model.trainable_weights)
         # grads = tf.clip_by_value(grads, -clip_value_grad, clip_value_grad, name=None)
@@ -957,7 +962,7 @@ def conventional_training(model, num_training_iterations, training_batch_size, e
             start_time2 = time.time()
 
 
-def script1(max_mc_iter=1000, num_target_block_errors=100, batch_size=10020):
+def script1_cmdnet_symbol_detection_qpsk_32x32(max_mc_iter=1000, num_target_block_errors=100, batch_size=10020):
     '''All CMDNet curves from the journal article for dimension 32x32 (effective dimension: 64x64)
     '''
     ber_plot = PlotBER()
@@ -972,15 +977,15 @@ def script1(max_mc_iter=1000, num_target_block_errors=100, batch_size=10020):
     # Test params
     snr_range = np.arange(1, 18, 1)  # [1, 13, 1], [1, 31, 1], [-3, 16, 0.5]
     # snr_range = np.arange(1, 12, 1), # -3, 16, 0.5
-    # int(10000 / (model1.num_tx_ant * model1.num_tx_ant / 4)), # 4096
+    # int(10000 / (model3_cmdnet.num_tx_ant * model3_cmdnet.num_tx_ant / 4)), # 4096
     # batch_size = 10020
     # max_mc_iter = 10  # 1000
     # num_target_block_errors = 100
 
     # Load starting point
-    algo0 = algo_mmse(constellation)
-    algo1 = algo_amp(Nit, constellation, num_tx_ant)
-    algo2 = algo_amp(Nit, constellation, num_tx_ant, binary=True)
+    algo0_mmse = algo_mmse(constellation)
+    algo1_amp = algo_amp(Nit, constellation, num_tx_ant)
+    algo2_amp = algo_amp(Nit, constellation, num_tx_ant, binary=True)
 
     if GLOBAL_PRECISION == 'float64':
         sub_folder = 'data_cmdnet_sionna' + '_float64'
@@ -990,140 +995,211 @@ def script1(max_mc_iter=1000, num_target_block_errors=100, batch_size=10020):
     # saveobj2 = mf.savemodule('npz')
     # train_hist2 = mf.training_history()
     # sim_set = {'Mod': 'QPSK', 'Nr': 64, 'Nt': 64, 'L': 64,} # BPSK, QPSK, QAM16
-    # fn = mf.filename_module('trainhist_', 'curves', 'CMD', '_binary_tau0.1', sim_set) # _binary_tau0.1, _tau0.1, _convex, _binary_tau0.075, '_binary_splin'
+    # fn = mf.filename_module('trainhist_', 'tf1_curves', 'CMD', '_binary_tau0.1', sim_set) # _binary_tau0.1, _tau0.1, _convex, _binary_tau0.075, '_binary_splin'
     # train_hist2.dict2obj(saveobj2.load(fn.pathfile))
     # [delta0, taui0] = train_hist2.params[-1]
 
     # , taui0 = taui0, delta0 = delta0)
-    algo3 = algo_cmdnet(Nit, constellation, num_tx_ant, binary=True)
+    algo3_cmdnet = algo_cmdnet(Nit, constellation, num_tx_ant, binary=True)
     sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
                num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit, }
     fn = cmd_utils.filename_module(sub_folder, 'weights_',
-                                   algo3.algo_name, 'binary_tau0.1', sim_set)
-    algo3.load_weights(fn.pathfile)
+                                   algo3_cmdnet.algo_name, 'binary_tau0.1', sim_set)
+    algo3_cmdnet.load_weights(fn.pathfile)
 
     # , taui0 = taui0, delta0 = delta0)
-    algo4 = algo_cmdnet(Nit, constellation, num_tx_ant, binary=False)
+    algo4_cmdnet_multiclass = algo_cmdnet(
+        Nit, constellation, num_tx_ant, binary=False)
     sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
                num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit, }
     fn = cmd_utils.filename_module(sub_folder, 'weights_',
-                                   algo4.algo_name, 'tau0.1', sim_set)
-    algo4.load_weights(fn.pathfile)
+                                   algo4_cmdnet_multiclass.algo_name, 'tau0.1', sim_set)
+    algo4_cmdnet_multiclass.load_weights(fn.pathfile)
 
     # , taui0 = taui0, delta0 = delta0
-    algo5 = algo_cmdnet(16, constellation, num_tx_ant, binary=True)
+    algo5_cmdnet_NL16 = algo_cmdnet(16, constellation, num_tx_ant, binary=True)
     sim_set = {'Mod': mod + str(num_bits_per_symbol),
                'Nr': 2 * num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': 16, }
     fn = cmd_utils.filename_module(sub_folder, 'weights_',
-                                   algo5.algo_name, 'binary_tau0.075', sim_set)
-    algo5.load_weights(fn.pathfile)
+                                   algo5_cmdnet_NL16.algo_name, 'binary_tau0.075', sim_set)
+    algo5_cmdnet_NL16.load_weights(fn.pathfile)
 
     # , taui0 = taui0, delta0 = delta0
-    algo6 = algo_cmdnet(Nit, constellation, num_tx_ant, binary=True)
+    algo6_cmdnet_splin = algo_cmdnet(
+        Nit, constellation, num_tx_ant, binary=True)
     sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
                num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit, }
     fn = cmd_utils.filename_module(sub_folder, 'weights_',
-                                   algo6.algo_name, 'binary_splin', sim_set)
-    algo6.load_weights(fn.pathfile)
+                                   algo6_cmdnet_splin.algo_name, 'binary_splin', sim_set)
+    algo6_cmdnet_splin.load_weights(fn.pathfile)
 
     delta0, taui0 = cmd_utils.CMD_initpar(
         M=2, L=64, typ='default', min_val=0.1)
-    algo7 = algo_cmdnet(Nit, constellation, num_tx_ant,
-                        binary=True, taui0=taui0, delta0=delta0)
+    algo7_cmdnet_default_init = algo_cmdnet(Nit, constellation, num_tx_ant,
+                                            binary=True, taui0=taui0, delta0=delta0)
     delta0, taui0 = cmd_utils.CMD_initpar(
         M=2, L=64, typ='linear', min_val=0.01)
-    algo8 = algo_cmdnet(Nit, constellation, num_tx_ant,
-                        binary=True, taui0=taui0, delta0=delta0)
+    algo8_cmdnet_splin_init = algo_cmdnet(Nit, constellation, num_tx_ant,
+                                          binary=True, taui0=taui0, delta0=delta0)
 
     # model1.algo.load_weights('data_cmdnet_sionna/weights')
-    model0 = CommunicationModel(algo=algo0, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model1 = CommunicationModel(algo=algo1, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model2 = CommunicationModel(algo=algo2, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model3 = CommunicationModel(algo=algo3, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model4 = CommunicationModel(algo=algo4, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model5 = CommunicationModel(algo=algo5, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model6 = CommunicationModel(algo=algo6, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model7 = CommunicationModel(algo=algo7, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model8 = CommunicationModel(algo=algo8, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
+    model0_mmse = CommunicationModel(algo=algo0_mmse, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                     const=constellation, code=code, trainbit=trainbit)
+    model1_amp = CommunicationModel(algo=algo1_amp, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                    const=constellation, code=code, trainbit=trainbit)
+    model2_amp = CommunicationModel(algo=algo2_amp, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                    const=constellation, code=code, trainbit=trainbit)
+    model3_cmdnet = CommunicationModel(algo=algo3_cmdnet, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                       const=constellation, code=code, trainbit=trainbit)
+    model4_cmdnet = CommunicationModel(algo=algo4_cmdnet_multiclass, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                       const=constellation, code=code, trainbit=trainbit)
+    model5_cmdnet = CommunicationModel(algo=algo5_cmdnet_NL16, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                       const=constellation, code=code, trainbit=trainbit)
+    model6_cmdnet = CommunicationModel(algo=algo6_cmdnet_splin, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                       const=constellation, code=code, trainbit=trainbit)
+    model7_cmdnet = CommunicationModel(algo=algo7_cmdnet_default_init, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                       const=constellation, code=code, trainbit=trainbit)
+    model8_cmdnet = CommunicationModel(algo=algo8_cmdnet_splin_init, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                       const=constellation, code=code, trainbit=trainbit)
 
-    ber_plot.simulate(model0,
+    ber_plot.simulate(model0_mmse,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend="LMMSE (Uncorrelated)",
                       show_fig=False)
-    ber_plot.simulate(model1,
+    ber_plot.simulate(model1_amp,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend="AMP N_it = 64",
                       show_fig=False)
-    ber_plot.simulate(model2,
+    ber_plot.simulate(model2_amp,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend="AMP bin N_it = 64",
                       show_fig=False)
-    ber_plot.simulate(model3,
+    ber_plot.simulate(model3_cmdnet,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend='CMDNet bin N_L = 64',
                       show_fig=False)
-    ber_plot.simulate(model4,
+    ber_plot.simulate(model4_cmdnet,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend='CMDNet N_L = 64',
                       show_fig=False)
-    ber_plot.simulate(model5,
+    ber_plot.simulate(model5_cmdnet,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
-                      legend='CMDNet N_L = 16',
+                      legend='CMDNet bin N_L = 16',
                       show_fig=False)
-    ber_plot.simulate(model6,
+    ber_plot.simulate(model6_cmdnet,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
-                      legend='CMDNet splin',
+                      legend='CMDNet bin splin',
                       show_fig=False)
-    ber_plot.simulate(model7,
+    ber_plot.simulate(model7_cmdnet,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
-                      legend='CMDNet spdef Ntrain=0',
+                      legend='CMDNet bin spdef Ntrain=0',
                       show_fig=False)
-    ber_plot.simulate(model8,
+    ber_plot.simulate(model8_cmdnet,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
-                      legend='CMDNet splin Ntrain=0',
+                      legend='CMDNet bin splin Ntrain=0',
                       # save_fig = True,
-                      show_fig=True)
+                      show_fig=False)
 
-    tplt.save('plots/cmdnet_sionna_script1_QAM4_64x64.tikz')
+    sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 * num_rx_ant,
+               'Nt': 2 * num_tx_ant, 'L': Nit}
+    curve_file = plot_cmdnet_tf1_curve(sim_set)
+    # Other original TF1 simulation results curves
+    # curve_file = plot_cmdnet_tf1_curve(sim_set, fn_extension='binary_splin')
+    # curve_file = plot_cmdnet_tf1_curve(sim_set, fn_extension='tau0.1')
+    # sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 * num_rx_ant,
+    #            'Nt': 2 * num_tx_ant, 'L': 16}
+    # curve_file = plot_cmdnet_tf1_curve(sim_set)
+    ber_plot(snr_db=curve_file['ebn0'],
+             ber=curve_file['ber'], legend='CMDNet TF1', is_bler=False)
+    try:
+        tplt.save('plots/cmdnet_sionna_script1_QAM4_64x64.tikz')
+    except Exception as e:
+        print(e)
+
+    return ber_plot
 
 
-def script2(max_mc_iter=1000, num_target_block_errors=100, batch_size=10020):
+def plot_cmdnet_tf1_curve(sim_set, fn_extension='', algo='CMD'):
+    '''Plots the curve of the original CMDNet implementation in TensorFlow 1
+    Reference curve for new TF2 implementation
+    mod_curves BPSK, QPSK, QAM16
+    '''
+    sim_set_converted = sim_set
+    sim_set_converted['Mod'] = sionna_modulation2cmdnet_modulation_name(
+        sim_set_converted['Mod'])
+    mod_curves = sim_set_converted['Mod']
+    nrx = sim_set_converted['Nr']
+    ntx = sim_set_converted['Nt']
+    nit = sim_set_converted['L']
+
+    # Select specific CMDNet curve from TensorFlow 1 implementation
+
+    if fn_extension == '':
+        if mod_curves == 'QAM16' and ntx == 64 and nrx == 64 and nit == 64:
+            fn_extension = 'convex'
+        elif mod_curves == 'QPSK' and ntx == 64 and nrx == 64 and nit == 64:
+            fn_extension = 'binary_tau0.1'
+            # fn_extension = 'binary_splin'
+            # fn_extension = 'tau0.1'
+        elif mod_curves == 'QPSK' and ntx == 64 and nrx == 64 and nit == 16:
+            fn_extension = 'binary_tau0.075'
+        elif mod_curves == 'QPSK' and ntx == 16 and nrx == 16 and nit == 16:
+            fn_extension = 'binary'
+        else:
+            print('No specific curve selected.')
+            fn_extension = ''
+
+    fn = cmd_utils.filename_module(
+        'tf1_curves', 'RES_', algo, fn_extension, sim_set_converted, code_set=0, tf=1)
+
+    pathfile = fn.pathfile + '.npz'
+    curve_file = np.load(pathfile)
+    # plt.semilogy(curve_file['ebn0'], curve_file['ber'],
+    #              'r-o', label='CMDNet TF1')
+    return curve_file
+
+
+def sionna_modulation2cmdnet_modulation_name(mod):
+    '''Translates Sionna name of modulations to CMDNet standard
+    '''
+    if mod == 'qam2':
+        mod_curves = 'QPSK'
+    elif mod == 'qam4':
+        mod_curves = 'QAM16'
+    else:
+        print('Not available in curves.')
+        mod_curves = mod
+    return mod_curves
+
+
+def script2_cmdnet_symbol_detection_qpsk_8x8(max_mc_iter=1000, num_target_block_errors=100, batch_size=10020):
     '''All CMDNet curves from the journal article for dimension 8x8 (effective dimension: 16x16)
     '''
     ber_plot = PlotBER()
@@ -1144,9 +1220,9 @@ def script2(max_mc_iter=1000, num_target_block_errors=100, batch_size=10020):
     # num_target_block_errors = 100
 
     # Load starting point
-    algo0 = algo_mmse(constellation)
-    # algo1 = algo_amp(Nit, constellation, num_tx_ant)
-    algo2 = algo_amp(Nit, constellation, num_tx_ant, binary=True)
+    algo0_mmse = algo_mmse(constellation)
+    # algo1_amp = algo_amp(Nit, constellation, num_tx_ant)
+    algo2_amp = algo_amp(Nit, constellation, num_tx_ant, binary=True)
 
     if GLOBAL_PRECISION == 'float64':
         sub_folder = 'data_cmdnet_sionna' + '_float64'
@@ -1154,55 +1230,65 @@ def script2(max_mc_iter=1000, num_target_block_errors=100, batch_size=10020):
         sub_folder = 'data_cmdnet_sionna'
 
     # , taui0 = taui0, delta0 = delta0)
-    algo3 = algo_cmdnet(Nit, constellation, num_tx_ant, binary=True)
+    algo3_cmdnet = algo_cmdnet(Nit, constellation, num_tx_ant, binary=True)
     sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
                num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit, }
     fn = cmd_utils.filename_module(sub_folder, 'weights_',
-                                   algo3.algo_name, 'binary', sim_set)
-    algo3.load_weights(fn.pathfile)
+                                   algo3_cmdnet.algo_name, 'binary', sim_set)
+    algo3_cmdnet.load_weights(fn.pathfile)
 
-    model0 = CommunicationModel(algo=algo0, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    # model1 = CommunicationModel(algo = algo1, num_tx_ant = num_tx_ant, num_rx_ant = num_rx_ant, const = constellation, code = code, trainbit = trainbit)
-    model2 = CommunicationModel(algo=algo2, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model3 = CommunicationModel(algo=algo3, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
+    model0_mmse = CommunicationModel(algo=algo0_mmse, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                     const=constellation, code=code, trainbit=trainbit)
+    # model1_amp = CommunicationModel(algo = algo1_amp, num_tx_ant = num_tx_ant, num_rx_ant = num_rx_ant, const = constellation, code = code, trainbit = trainbit)
+    model2_amp = CommunicationModel(algo=algo2_amp, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                    const=constellation, code=code, trainbit=trainbit)
+    model3_cmdnet = CommunicationModel(algo=algo3_cmdnet, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                       const=constellation, code=code, trainbit=trainbit)
 
-    ber_plot.simulate(model0,
+    ber_plot.simulate(model0_mmse,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend="LMMSE (Uncorrelated)",
                       show_fig=False)
-    # ber_plot.simulate(model1,
+    # ber_plot.simulate(model1_amp,
     #         snr_range,
     #         batch_size = batch_size,
     #         max_mc_iter = max_mc_iter,
     #         num_target_block_errors = num_target_block_errors,
     #         legend = "AMP N_it = 16",
     #         show_fig = False);
-    ber_plot.simulate(model2,
+    ber_plot.simulate(model2_amp,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend="AMP bin N_it = 16",
                       show_fig=False)
-    ber_plot.simulate(model3,
+    ber_plot.simulate(model3_cmdnet,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend='CMDNet bin N_L = 16',
                       # save_fig = True,
-                      show_fig=True)
+                      show_fig=False)
 
-    tplt.save('plots/cmdnet_sionna_script2_QAM4_16x16.tikz')
+    sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 * num_rx_ant,
+               'Nt': 2 * num_tx_ant, 'L': Nit}
+    curve_file = plot_cmdnet_tf1_curve(sim_set)
+    ber_plot(snr_db=curve_file['ebn0'],
+             ber=curve_file['ber'], legend='CMDNet TF1', is_bler=False)
+
+    try:
+        tplt.save('plots/cmdnet_sionna_script2_QAM4_16x16.tikz')
+    except Exception as e:
+        print(e)
+    return ber_plot
 
 
-def script3(max_mc_iter=1000, num_target_block_errors=1000, batch_size=10020):
+def script3_cmdnet_symbol_detection_qam16_32x32(max_mc_iter=1000, num_target_block_errors=1000, batch_size=10020):
     '''All CMDNet curves from the journal article for QAM16 modulation dimension 32x32 (effective 4-ASK modulation and dimension: 64x64)
     '''
     ber_plot = PlotBER()
@@ -1221,8 +1307,8 @@ def script3(max_mc_iter=1000, num_target_block_errors=1000, batch_size=10020):
     # num_target_block_errors = 1000
 
     # Load starting point
-    algo0 = algo_mmse(constellation)
-    algo1 = algo_amp(Nit, constellation, num_tx_ant)
+    algo0_mmse = algo_mmse(constellation)
+    algo1_amp = algo_amp(Nit, constellation, num_tx_ant)
 
     if GLOBAL_PRECISION == 'float64':
         sub_folder = 'data_cmdnet_sionna' + '_float64'
@@ -1230,48 +1316,58 @@ def script3(max_mc_iter=1000, num_target_block_errors=1000, batch_size=10020):
         sub_folder = 'data_cmdnet_sionna'
 
     # , taui0 = taui0, delta0 = delta0)
-    algo2 = algo_cmdnet(Nit, constellation, num_tx_ant)
+    algo2_cmdnet = algo_cmdnet(Nit, constellation, num_tx_ant)
     sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
                num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit, }
     fn = cmd_utils.filename_module(sub_folder, 'weights_',
-                                   algo2.algo_name, 'convex', sim_set)
-    algo2.load_weights(fn.pathfile)
+                                   algo2_cmdnet.algo_name, 'convex', sim_set)
+    algo2_cmdnet.load_weights(fn.pathfile)
 
-    model0 = CommunicationModel(algo=algo0, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model1 = CommunicationModel(algo=algo1, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
-    model2 = CommunicationModel(algo=algo2, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
+    model0_mmse = CommunicationModel(algo=algo0_mmse, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                     const=constellation, code=code, trainbit=trainbit)
+    model1_amp = CommunicationModel(algo=algo1_amp, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                    const=constellation, code=code, trainbit=trainbit)
+    model2_cmdnet = CommunicationModel(algo=algo2_cmdnet, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                       const=constellation, code=code, trainbit=trainbit)
 
-    ber_plot.simulate(model0,
+    ber_plot.simulate(model0_mmse,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend="LMMSE (Uncorrelated)",
                       show_fig=False)
-    ber_plot.simulate(model1,
+    ber_plot.simulate(model1_amp,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
-                      legend="AMP bin N_it = 64",
+                      legend="AMP N_it = 64",
                       show_fig=False)
-    ber_plot.simulate(model2,
+    ber_plot.simulate(model2_cmdnet,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
-                      legend='CMDNet bin N_L = 64',
+                      legend='CMDNet N_L = 64',
                       # save_fig = True,
-                      show_fig=True)
+                      show_fig=False)
 
-    tplt.save('plots/cmdnet_sionna_script3_QAM16_64x64.tikz')
+    sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 * num_rx_ant,
+               'Nt': 2 * num_tx_ant, 'L': Nit}
+    curve_file = plot_cmdnet_tf1_curve(sim_set)
+    ber_plot(snr_db=curve_file['ebn0'],
+             ber=curve_file['ber'], legend='CMDNet TF1', is_bler=False)
+
+    try:
+        tplt.save('plots/cmdnet_sionna_script3_QAM16_64x64.tikz')
+    except Exception as e:
+        print(e)
+    return ber_plot
 
 
-def script4(max_mc_iter=100, num_target_block_errors=100, batch_size=10):
-    '''All CMDNet curves with code from the journal article for QPSK modulation and dimension 32x32 (effective BPSK modulation and dimension: 64x64)
+def script4_cmdnet_qpsk_32x32_with_channel_code(max_mc_iter=100, num_target_block_errors=100, batch_size=10, tf1_code=False):
+    '''All CMDNet curves with channel code from the journal article for QPSK modulation and dimension 32x32 (effective BPSK modulation and dimension: 64x64)
     Idea: Try using with old BP implementation -> no change -> problem lies within new cmdnet implementation
     float64 precision required for reproduction, worse results with float32 -> not implementable in Sionna
     '''
@@ -1294,8 +1390,8 @@ def script4(max_mc_iter=100, num_target_block_errors=100, batch_size=10):
     # num_target_block_errors = 100  # 1000
 
     # Load starting point
-    algo0 = algo_mmse(constellation)
-    algo1 = algo_amp(Nit, constellation, num_tx_ant)
+    algo0_mmse = algo_mmse(constellation)
+    algo1_amp = algo_amp(Nit, constellation, num_tx_ant)
 
     if GLOBAL_PRECISION == 'float64':
         sub_folder = 'data_cmdnet_sionna' + '_float64'
@@ -1303,32 +1399,34 @@ def script4(max_mc_iter=100, num_target_block_errors=100, batch_size=10):
         sub_folder = 'data_cmdnet_sionna'
 
     # , taui0 = taui0, delta0 = delta0)
-    algo2 = algo_cmdnet(Nit, constellation, num_tx_ant)
+    algo2_cmdnet = algo_cmdnet(Nit, constellation, num_tx_ant, binary=True)
     sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
                num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit, }
     fn = cmd_utils.filename_module(sub_folder, 'weights_',
-                                   algo2.algo_name, 'binary_tau0.1', sim_set)
-    algo2.load_weights(fn.pathfile)
+                                   algo2_cmdnet.algo_name, 'binary_tau0.1', sim_set)
+    algo2_cmdnet.load_weights(fn.pathfile)
 
-    model0 = CommunicationModel(algo=algo0, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant, const=constellation,
-                                code=True, n=n, k=k, code_it=Ncit)
-    model1 = CommunicationModel(algo=algo1, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant, const=constellation,
-                                code=True, n=n, k=k, code_it=Ncit)
-    model2 = CommunicationModel(algo=algo2, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant, const=constellation,
-                                code=True, n=n, k=k, code_it=Ncit)
-    model3 = CommunicationModel(algo=algo2, num_tx_ant=num_tx_ant,
-                                num_rx_ant=num_rx_ant, const=constellation)
+    model0_mmse = CommunicationModel(algo=algo0_mmse, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant, const=constellation,
+                                     code=True, n=n, k=k, code_it=Ncit, tf1_code=tf1_code)
+    model1_amp = CommunicationModel(algo=algo1_amp, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant, const=constellation,
+                                    code=True, n=n, k=k, code_it=Ncit, tf1_code=tf1_code)
+    model2_cmdnet_with_code = CommunicationModel(algo=algo2_cmdnet, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant, const=constellation,
+                                                 code=True, n=n, k=k, code_it=Ncit, tf1_code=tf1_code)
+    model3_cmdnet = CommunicationModel(algo=algo2_cmdnet, num_tx_ant=num_tx_ant,
+                                       num_rx_ant=num_rx_ant, const=constellation)
 
-    ber_plot.simulate(model0,
+    ber_plot.simulate(model0_mmse,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend="LMMSE (Uncorrelated)",
+                      #   add_ber=False,
+                      #   add_bler=True,
                       add_ber=False,
                       add_bler=True,
                       show_fig=False)
-    ber_plot.simulate(model1,
+    ber_plot.simulate(model1_amp,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
@@ -1337,7 +1435,7 @@ def script4(max_mc_iter=100, num_target_block_errors=100, batch_size=10):
                       add_ber=False,
                       add_bler=True,
                       show_fig=False)
-    ber_plot.simulate(model2,
+    ber_plot.simulate(model2_cmdnet_with_code,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
@@ -1346,7 +1444,7 @@ def script4(max_mc_iter=100, num_target_block_errors=100, batch_size=10):
                       add_ber=False,
                       add_bler=True,
                       show_fig=False)
-    ber_plot.simulate(model3,
+    ber_plot.simulate(model3_cmdnet,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
@@ -1355,93 +1453,135 @@ def script4(max_mc_iter=100, num_target_block_errors=100, batch_size=10):
                       add_ber=False,
                       add_bler=True,
                       # save_fig = True,
-                      show_fig=True)
+                      show_fig=False)
 
-    tplt.save('plots/cmdnet_sionna_script4_QAM4_64x64_wcode.tikz')
+    if tf1_code is True:
+        sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 * num_rx_ant,
+                   'Nt': 2 * num_tx_ant, 'L': Nit}
+        curve_file = plot_cmdnet_tf1_curve(
+            sim_set, fn_extension='LDPC64x128bphoriz_binary_tau0.1_float64')
+        curve_file2 = plot_cmdnet_tf1_curve(
+            sim_set, fn_extension='LDPC64x128bphoriz_binary_tau0.1')
+        curve_file3 = plot_cmdnet_tf1_curve(
+            sim_set, fn_extension='LDPC64x128bphoriz', algo='AMP')
+        curve_file4 = plot_cmdnet_tf1_curve(
+            sim_set, fn_extension='LDPC64x128bphoriz', algo='MMSE')
+        curve_file5 = plot_cmdnet_tf1_curve(sim_set)
+        # ber_plot(snr_db=[curve_file['cebn0'], curve_file2['cebn0']],
+        #          ber=[curve_file['cfer'], curve_file2['cfer']], legend=['CMDNet + LDPC64x128 TF1 float64', 'CMDNet + LDPC64x128 TF1 float32'], is_bler=[True, True])
+        ber_plot(snr_db=[curve_file['cebn0'], curve_file2['cebn0'], curve_file3['cebn0'], curve_file4['cebn0'], curve_file5['cebn0']],
+                 ber=[curve_file['cfer'], curve_file2['cfer'], curve_file3['cfer'], curve_file4['cfer'], curve_file5['fer']], legend=['CMDNet + LDPC64x128 TF1 float64', 'CMDNet + LDPC64x128 TF1 float32', 'AMP + LDPC64x128 TF1 float64', 'MMSE + LDPC64x128 TF1 float64', 'CMDNet bin N_L = 64 uncoded TF1'], is_bler=[True, True, True, True, True])
+    try:
+        tplt.save('plots/cmdnet_sionna_script4_QAM4_64x64_wcode.tikz')
+    except Exception as e:
+        print(e)
+    return ber_plot
 
 
-def script5(max_mc_iter=100, num_target_block_errors=100, batch_size=10020):
+def script5_cmdnet_qpsk_32x32_training(max_mc_iter=100, num_target_block_errors=100, batch_size=10020, it_print=100, code=0, tf1_code=False, original_file=True, trainbit=True):
     '''Exemplary training for binary CMDNet for QPSK modulation and dimension 32x32 (effective BPSK modulation and dimension: 64x64)
+    code: Joint training with code - New simulation/idea
     '''
     # tf.config.run_functions_eagerly(True)
 
     # Training
-    code = 0
-    trainbit = 0
     mod = 'qam'
     num_tx_ant = 32
     num_rx_ant = 32
     Nit = num_tx_ant * 2
     num_bits_per_symbol = 2
     constellation = Constellation(mod, num_bits_per_symbol, trainable=False)
+    code_it = 10
     # Test params
     ber_plot = PlotBER()
     snr_range = np.arange(1, 18, 1)
     # batch_size = 10020
     # max_mc_iter = 100                   # 100
     # num_target_block_errors = 100       # 100
-    it_print = 1
+    # it_print = 1
 
     # Algorithm and Model
-    delta0, taui0 = cmd_utils.CMD_initpar(
-        M=2, L=Nit, typ='default', min_val=0.1)
-    algo1 = algo_cmdnet(Nit, constellation, num_tx_ant,
-                        binary=True, taui0=taui0, delta0=delta0)
     if GLOBAL_PRECISION == 'float64':
         sub_folder = 'data_cmdnet_sionna' + '_float64'
     else:
         sub_folder = 'data_cmdnet_sionna'
-    # Load pretrained weights
-    # sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 * num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit,}
-    # fn = filename_module(sub_folder, 'weights_', algo1.algo_name, 'binary_tau0.1', sim_set)
-    # algo1.load_weights(fn.pathfile)
-    model1 = CommunicationModel(algo=algo1, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
+
+    if original_file is True:
+        # Original initialization of CMDNet
+        delta0, taui0 = cmd_utils.CMD_initpar(
+            M=2, L=Nit, typ='default', min_val=0.1)
+        algo1_cmdnet = algo_cmdnet(Nit, constellation, num_tx_ant,
+                                   binary=True, taui0=taui0, delta0=delta0)
+    else:
+        # Load pretrained weights
+        sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
+                   num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit, }
+        fn = cmd_utils.filename_module(
+            sub_folder, 'weights_', algo1_cmdnet.algo_name, 'binary_tau0.1', sim_set)
+        algo1_cmdnet.load_weights(fn.pathfile)
+    model1_cmdnet = CommunicationModel(algo=algo1_cmdnet, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                       const=constellation, code=code, code_it=code_it, tf1_code=tf1_code, trainbit=trainbit)
 
     # Training parameters
-    # w/o code: 1000 -> 500 ?, w code: 10/1
-    training_batch_size = 500
     train_iter = 100000                 # 100000
-    # w/o code: [7, 26], w code: [0, 3] # QAM16: [10, 33]
-    ebno_db_train = [4, 27]
-    conventional_training(model1, train_iter, training_batch_size,
+    # w/o code: 1000 -> 500 ?, w code: 10/1
+    if code is True:
+        training_batch_size = 10
+    else:
+        training_batch_size = 500
+    # w/o code, QPSK: [7, 26], QAM16: [10, 33], w code: [0, 3]
+    if code is True:
+        ebno_db_train = [0, 3]
+    else:
+        ebno_db_train = [4, 27]
+    conventional_training(model1_cmdnet, train_iter, training_batch_size,
                           ebno_db_train, it_print=it_print)
     # Save after training
     sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
                num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit, }
     fn = cmd_utils.filename_module(sub_folder, 'weights_',
-                                   algo1.algo_name, 'test', sim_set)
+                                   algo1_cmdnet.algo_name, 'test', sim_set)
     # Path has to be shorter...
     path = os.path.join(fn.path, 'weights')
-    model1.algo.save_weights(path)
+    model1_cmdnet.algo.save_weights(path)
 
     # Comparison
-    algo2 = algo_cmdnet(Nit, constellation, num_tx_ant,
-                        binary=True, taui0=taui0, delta0=delta0)
+    algo2_cmdnet_trained = algo_cmdnet(Nit, constellation, num_tx_ant,
+                                       binary=True, taui0=taui0, delta0=delta0)
     sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
                num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit, }
     fn = cmd_utils.filename_module(sub_folder, 'weights_',
-                                   algo1.algo_name, 'binary_tau0.1', sim_set)
-    algo2.load_weights(fn.pathfile)
-    model2 = CommunicationModel(algo=algo2, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
-                                const=constellation, code=code, trainbit=trainbit)
+                                   algo1_cmdnet.algo_name, 'binary_tau0.1', sim_set)
+    algo2_cmdnet_trained.load_weights(fn.pathfile)
+    model2_cmdnet_trained = CommunicationModel(algo=algo2_cmdnet_trained, num_tx_ant=num_tx_ant, num_rx_ant=num_rx_ant,
+                                               const=constellation, code=code, code_it=code_it, tf1_code=tf1_code, trainbit=trainbit)
 
-    ber_plot.simulate(model1,
+    ber_plot.simulate(model1_cmdnet,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
-                      legend='CMDNet trained',
+                      legend='CMDNet bin TF2 trained',
                       show_fig=False)
-    ber_plot.simulate(model2,
+    ber_plot.simulate(model2_cmdnet_trained,
                       snr_range,
                       batch_size=batch_size,
                       max_mc_iter=max_mc_iter,
                       num_target_block_errors=num_target_block_errors,
                       legend='CMDNet bin N_L = 64',
-                      show_fig=True)
+                      show_fig=False)
 
-    tplt.save('plots/cmdnet_sionna_script5_QAM4_64x64_training.tikz')
+    sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 * num_rx_ant,
+               'Nt': 2 * num_tx_ant, 'L': Nit}
+    curve_file = plot_cmdnet_tf1_curve(sim_set)
+    ber_plot(snr_db=curve_file['ebn0'],
+             ber=curve_file['ber'], legend='CMDNet TF1', is_bler=False)
+
+    try:
+        tplt.save('plots/cmdnet_sionna_script5_QAM4_64x64_training.tikz')
+    except Exception as e:
+        print(e)
+    return ber_plot
 
 
 if __name__ == '__main__':
@@ -1449,34 +1589,42 @@ if __name__ == '__main__':
     # def my_func_main():
     # tf.debugging.enable_check_numerics()
     # tf.config.run_functions_eagerly(True)
+    cmd_utils.gpu_select(number=0, memory_growth=True, cpus=0)
     tf.keras.backend.set_floatx(GLOBAL_PRECISION)
-    # os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/home/beck/miniconda3/envs/ml3/lib'
 
     # Choose example test script
-    # 0: CMDNet QPSK 64x64
-    # 1: CMDNet QPSK 16x16
-    # 2: CMDNet QAM16 64x64
-    # 3: CMDNet with code (float 32 precision problem...)
-    # 4: Training of CMDNet
-    EXAMPLE = 1
-    # Simulation parameters
+    # 0: CMDNet QPSK 32x32 (BPSK 64x64)
+    # 1: CMDNet QPSK 8x8 (BPSK 16x16)
+    # 2: CMDNet QAM16 32x32 (QAM4 64x64)
+    # 3: CMDNet QPSK 32x32 (BPSK 64x64) with new subsequent 128x64/5G channel code (slightly worse BLER with float32 precision compared to float64 in journal article)
+    # 4: Training of CMDNet QPSK 32x32 (BPSK 64x64) (Also works with trainbit = True)
+    # 5: New joint training of CMDNet and 128x64/5G channel coding, QPSK 32x32 (BPSK 64x64)
+    # 5 is so far not numerically and needs debugging (NaN at training time)
+
+    EXAMPLE = 0
+    # Use 128x64 (journal article) or 5G channel code
+    tf1_code = True
+    # Simulation parameters defining plot accuracy
     max_mc_iter = 100              # 1000 in article, 100 for faster simulations
     num_target_block_errors = 100  # 1000 in article, 100 for faster simulations
 
     if EXAMPLE == 0:
-        script1(max_mc_iter=max_mc_iter,
-                num_target_block_errors=num_target_block_errors)
+        ber_plot = script1_cmdnet_symbol_detection_qpsk_32x32(max_mc_iter=max_mc_iter,
+                                                              num_target_block_errors=num_target_block_errors)
     elif EXAMPLE == 1:
-        script2(max_mc_iter=max_mc_iter,
-                num_target_block_errors=num_target_block_errors)
+        ber_plot = script2_cmdnet_symbol_detection_qpsk_8x8(max_mc_iter=max_mc_iter,
+                                                            num_target_block_errors=num_target_block_errors)
     elif EXAMPLE == 2:
-        script3(max_mc_iter=max_mc_iter,
-                num_target_block_errors=num_target_block_errors)
+        ber_plot = script3_cmdnet_symbol_detection_qam16_32x32(max_mc_iter=max_mc_iter,
+                                                               num_target_block_errors=num_target_block_errors)
     elif EXAMPLE == 3:
-        script4(max_mc_iter=100,
-                num_target_block_errors=num_target_block_errors, batch_size=10)
+        ber_plot = script4_cmdnet_qpsk_32x32_with_channel_code(max_mc_iter=100,
+                                                               num_target_block_errors=num_target_block_errors, batch_size=10, tf1_code=tf1_code)
     elif EXAMPLE == 4:
-        script5(max_mc_iter=max_mc_iter,
-                num_target_block_errors=num_target_block_errors)
+        ber_plot = script5_cmdnet_qpsk_32x32_training(max_mc_iter=max_mc_iter,
+                                                      num_target_block_errors=num_target_block_errors, it_print=100, trainbit=False)
+    elif EXAMPLE == 5:
+        ber_plot = script5_cmdnet_qpsk_32x32_training(max_mc_iter=max_mc_iter,
+                                                      num_target_block_errors=num_target_block_errors, it_print=100, code=True, tf1_code=tf1_code)
     else:
         print('No test script selected.')

@@ -8,6 +8,8 @@ Created on Tue Dec 02 15:28:68 2025
 
 import os
 import numpy as np
+import tensorflow as tf
+from tensorflow.keras import backend as KB
 
 
 class modulation():
@@ -234,7 +236,7 @@ class filename_module():
     name = 'File name creator'
     # Initializer / Instance Attributes
 
-    def __init__(self, path, typename, algo, fn_ext, sim_set, code_set=0):
+    def __init__(self, path, typename, algo, fn_ext, sim_set, code_set=0, tf=2):
         # Inputs
         # Path
         self.ospath = path
@@ -252,6 +254,7 @@ class filename_module():
         # Filename extension for uniqueness
         self.fn_ext = fn_ext
         self.code = code_set
+        self.tf = tf
         # Initialize
         self.generate_pathfile_MIMO()
     # Instance methods
@@ -271,8 +274,12 @@ class filename_module():
     def generate_path_MIMO(self):
         '''Generates path name
         '''
-        self.path = os.path.join(self.ospath, self.mod, '{}x{}'.format(
-            self.Nt, self.Nr), self.fn_ext)  # '/', '\\'
+        if self.tf == 2:
+            self.path = os.path.join(self.ospath, self.mod, '{}x{}'.format(
+                self.Nt, self.Nr), self.fn_ext)
+        else:
+            self.path = os.path.join(self.ospath, self.mod, '{}x{}'.format(
+                self.Nt, self.Nr))
         return self.path
 
     def generate_pathfile_MIMO(self):
@@ -294,70 +301,303 @@ def print_time(time):
     m, s = divmod(time, 60)
     h, m = divmod(m, 60)
     d, h = divmod(h, 24)
-    print_time_label = "{}:{:02d}:{:02d}:{:02d}".format(
+    time_label = "{}:{:02d}:{:02d}:{:02d}".format(
         -int(d), int(h), int(m), int(np.round(s)))
-    return print_time_label
+    return time_label
 
 
-# class cmdnet_bin2(tf.keras.Model):
-#     '''Binary CMDNet layer
-#     '''
-#     def __init__(self, it, m, alpha, taui0 = 1, delta0 = 1):
-#         super(cmdnet_bin2, self).__init__()
-#         self.it = tf.constant(it)
-#         self.m = m
-#         self.M = m.shape[0]
-#         # if (m == np.array([-1, 1])).all():
-#         alpha = alpha[:, 0]
-#         #else:
-#         #    alpha = alpha[:, 1]
-#         self.alphat = tf.constant(value = alpha)
-#         #func_tau = tau0 * np.ones(self.it + 1)
-#         self.taui = self.add_weight(shape = (it + 1,),
-#                              initializer = tf.keras.initializers.Constant(value = taui0),
-#                              trainable = True)
-#         self.delta = self.add_weight(shape = (it,),
-#                              initializer = tf.keras.initializers.Constant(value = delta0),
-#                              trainable = True)
-#         self.s0 = tf.constant(value = np.zeros_like(alpha))
-#         # self.G0 = self.add_weight(shape = alpha.shape,
-#         #                      initializer=tf.keras.initializers.Constant(value = np.zeros_like(alpha)),
-#         #                      trainable=False)
-#         # self.taui = tf.Variable(initial_value = 1 / func_tau,
-#         #                         trainable = True)
-#         # self.delta = tf.Variable(initial_value = delta0 * np.ones(it),
-#         #                          trainable = True)
-#         #b_init = tf.zeros_initializer()
-#         #self.b = tf.Variable(initial_value=b_init(shape=(units,),
-#         #                                          dtype='float32'),
-#         #                     trainable=True)
+def encoder(b, G):
+    '''Encodes bitvector b with code given in generator matrix G of coding theory dimensions
+    b: bit stream or bit vectors
+    c: code bits
+    '''
+    if len(b.shape) == 1:
+        b2 = b[:len(b) - np.mod(len(b), G.shape[0])]
+        b2 = np.reshape(b2, (-1, G.shape[0]))
+    else:
+        # b2 = b.copy()
+        b2 = b
+    c = np.mod(np.dot(b2, G), 2).astype('int')
+    return c
 
-#     #@tf.function#(jit_compile = True)
-#     def call(self, inputs):
-#         [yt, Ht, sigmat0] = inputs
-#         sigmat = tf.expand_dims(sigmat0, axis = -1)
 
-#         alphat = self.alphat
-#         s = KB.transpose(KB.expand_dims(self.s0)) * KB.ones_like(Ht[:, 0, :])
-#         taui_abs = KB.abs(self.taui[0])
-#         xt = KB.tanh((KB.log(1 / alphat - 1) + s) / 2 * taui_abs)
+# @tf.function  # (jit_compile = True)
+def encoder_tf(b, G):
+    """
+    Encode bitvector(s) b with generator matrix G (coding-theory style).
+    - b: 1D tensor (bit stream) or 2D tensor (batch of bit vectors). Values 0/1 expected.
+    - G: 2D tensor with shape (k, n) where k is message length.
+    Returns:
+    - c: 2D int32 tensor of codewords (values 0 or 1), shape (num_blocks, n)
+    """
 
-#         # UNFOLDING
-#         HH = KB.batch_dot(KB.permute_dimensions(Ht, (0, 2, 1)), Ht)
-#         yH = KB.batch_dot(yt, Ht)
-#         # HTy = tf.squeeze(tf.matmul(tf.transpose(Ht, [0, 2, 1]), tf.expand_dims(yt, axis = -1)), axis = -1)
-#         # HTH = tf.matmul(tf.transpose(Ht, [0, 2, 1]), Ht)
-#         for iteration in tf.range(0, self.it):
-#             xHH = KB.batch_dot(xt, HH)
-#             grad_x = 1 / 2 * taui_abs * (1 - xt ** 2)
-#             grad_L = sigmat ** 2 * KB.tanh(s / 2) + grad_x * (xHH - yH)
-#             # grad_L = KB.tanh(s / 2) + 1 / sigmat ** 2 * grad_x * (xHH - yH) # original version
-#             # Gradient/ResNet Layer
-#             s = s - self.delta[iteration] * grad_L
+    # handle 1D input: trim remainder and reshape into rows of length k
+    if b.shape.rank == 1:
+        G_shape = tf.shape(G)
+        k = G_shape[0]
+        L = tf.shape(b)[0]
+        rem = tf.math.floormod(L, k)
+        L2 = L - rem  # length we keep (may be 0)
+        # slice first L2 elements (works in graph & eager)
+        b_trimmed = tf.slice(b, [0], [L2])
+        b2 = tf.reshape(b_trimmed, tf.stack([-1, k]))
+    else:
+        # assume already shaped (num_blocks, k)
+        b2 = b
 
-#             # Start of new iteration
-#             taui_abs = KB.abs(self.taui[iteration + 1]) # no negative values for tau !
-#             xt = KB.tanh((KB.log(1 / alphat - 1) + s) / 2 * taui_abs)
-#             xt2 = KB.expand_dims(xt, axis = -1)
-#             ft = tf.concat([(1 + self.m[0] * xt2) / 2, (1 + self.m[1] * xt2) / 2], axis = -1) # [q(x = m_1), q(x = m_2)]
-#         return ft, xt
+    # cast to an integer type for matmul; int32 is fine on CPU/GPU
+    b2 = tf.cast(b2, tf.int32)
+    G = tf.cast(G, tf.int32)
+
+    # matrix multiply and reduce modulo 2 (GF(2) arithmetic)
+    c = tf.math.floormod(tf.matmul(b2, G), 2)
+
+    return tf.cast(c, tf.int32)
+
+
+class LinearBlockEncoder(tf.keras.layers.Layer):
+    def __init__(self, G, **kwargs):
+        super().__init__(**kwargs)
+        # store generator as a constant tensor (not trainable)
+        self.G = tf.cast(tf.constant(G), tf.int32)
+
+    def call(self, inputs):
+        return encoder_tf(inputs, self.G)
+
+
+def bp_decoder(llr, H, it, mode):
+    '''Soft decoding for given code reflected by parity check matrix H by belief propagation
+    llr:    Log-likelihood ratios
+    H:      Parity check matrix
+    it:     Number of iterations
+    mode:   Exact (0, default) and approximate (1) calculation of boxplus
+    '''
+    bp_out = llr
+    cv = 0
+    for _ in range(0, it):
+        vc = bp_out[:, :, np.newaxis] * H.T[np.newaxis, :, :] - cv
+        cv = boxplus(vc, H, mode)
+        bp_out = np.sum(cv, axis=-1) + llr
+
+    cr = (np.sign(bp_out) < 0) * 1
+    k = np.size(H, 1) - np.size(H, 0)
+    br = cr[:, 0: k]
+    return bp_out, cr, br
+
+
+def boxplus(llrs, H, mode):
+    '''Calculate boxplus operation of llrs with parity check matrix H
+    mode: 0: boxplus / 1: boxplus approximation
+    '''
+    if mode == 1:
+        H_uncon = (H == 0) * 1
+        sign = np.prod(np.sign(llrs) + np.expand_dims(H_uncon.T, 0), axis=1,
+                       keepdims=True) / np.sign(llrs + H_uncon.T[np.newaxis, :, :])
+        mask = (np.ones((H.shape[-1], H.shape[-1])) - np.eye(H.shape[-1]))
+        masked_llrs = np.transpose(np.abs(
+            llrs)[:, :, :, np.newaxis] * mask[np.newaxis, :, np.newaxis, :], (0, 3, 2, 1))
+        masked_llrs2 = np.ma.masked_equal(masked_llrs, 0.0, copy=False)
+        mini = np.array(np.min(masked_llrs2, axis=-1)) * \
+            H.T[np.newaxis, :, :]  # accurate
+        res = sign * mini
+    # elif mode == 2:
+    #     # alternative more compact but slow implementation: at least 4 times slower
+    #     mask = (np.ones((H.shape[-1], H.shape[-1])) - np.eye(H.shape[-1]))
+    #     masked_llrs = np.transpose(llrs[: , :, :, np.newaxis] * mask[np.newaxis, :, np.newaxis, :], (0, 3, 2, 1))
+    #     masked_llrs2 = np.ma.masked_equal(masked_llrs, 0.0, copy = False)
+    #     vc_tanh = np.tanh(np.clip(masked_llrs2 / 2, -1e12, 1e12))
+    #     cv = np.array(np.prod(vc_tanh, axis = -1)) * H.T[np.newaxis, :, :]
+    #     cv = np.clip(np.array(cv), -1 + 1e-12, 1 - 1e-12)
+    #     res = 2 * np.arctanh(cv)
+    else:
+        H_uncon = (H == 0) * 1
+        vc_tanh = np.tanh(np.clip(llrs / 2, -1e12, 1e12))
+        vc_tanh_prod = vc_tanh + H_uncon.T[np.newaxis, :, :]
+        cv = np.prod(vc_tanh_prod, 1, keepdims=True)
+        cv = (cv / vc_tanh_prod) * H.T[np.newaxis, :, :]
+        cv = np.clip(np.array(cv), -1 + 1e-12, 1 - 1e-12)
+        res = 2 * np.arctanh(cv)
+    return res
+
+
+def mimo_coding(c, Nt, M, arch):
+    '''Encode code words c horizontally or vertically into c2
+    INPUT
+    c: code words of dim (Nbc, n)
+    Nt: Number of transmit symbols
+    M: Modulation order
+    arch: PAC: Per antenna coding (horizontal) / PSC: Per stream coding (vertical)
+    OUTPUT
+    c2: MIMO encoding of c of dim (Nbc / n * log2(M), Nt, n / log2(M), log2(M))
+    '''
+    if arch == 'horiz':
+        rest = np.mod(c.shape[-1], np.log2(M))
+        if rest != 0:
+            c_end = np.random.randint(
+                2, size=(c.shape[0], int(np.log2(M) - rest)))
+            c0 = np.concatenate((c, c_end), axis=-1)
+        else:
+            c0 = c
+        c1 = c0.reshape((-1, int(Nt * np.log2(M)), c0.shape[-1]))
+        c2 = c1.reshape((c1.shape[0], c1.shape[1], int(
+            c1.shape[-1] / np.log2(M)), int(np.log2(M))))
+    elif arch == 'vert':
+        fit2x = Nt * np.log2(M) / c.shape[-1]
+        if int(fit2x) >= 1:
+            c0 = c.reshape((-1, int(c.shape[-1] * int(fit2x))))
+            c_end = np.random.randint(
+                2, size=(c0.shape[0], int(Nt * np.log2(M) - c0.shape[-1])))
+            c1 = np.concatenate((c0, c_end), axis=-1)
+            # expand dims by 1 for same processing
+            c2 = c1.reshape(
+                (c1.shape[0], int(c1.shape[1] / np.log2(M)), 1, int(np.log2(M))))
+        else:
+            c_end = np.random.randint(2, size=(c.shape[0], int(
+                Nt * np.log2(M) * np.ceil(1 / fit2x) - c.shape[-1])))
+            c0 = np.concatenate((c, c_end), axis=-1)
+            c1 = c0.reshape(
+                (-1, int(np.ceil(1 / fit2x)), int(Nt * np.log2(M))))
+            c2 = np.transpose(c1.reshape((c1.shape[0], c1.shape[1], int(
+                c1.shape[-1] / np.log2(M)), int(np.log2(M)))), (0, 2, 1, 3))
+    else:
+        print('Architecture not available.')
+    return c2
+
+
+def mimo_decoding(llr_c, n, Nt, M, arch):
+    '''Decode horizontally or vertically encoded code word llrs [llr_c] of equalizer dimensions back into original [llr_c2]
+    INPUT
+    llr_c: LLRs of code bits from equalizer of dim (Nb, Nt, log2(M))
+    n: code word length
+    Nt: Number of transmit symbols
+    M: Modulation order
+    arch: PAC: Per antenna coding (horizontal) / PSC: Per stream coding (vertical)
+    OUTPUT
+    llr_c2: Original order of llr_c of dim (Nbc, n)
+    '''
+    if arch == 'horiz':
+        llr_c1 = np.transpose(np.transpose(llr_c, (1, 0, 2)).reshape(
+            (llr_c.shape[-2], -1, int(n + np.mod(np.log2(M) - n, np.log2(M))))), (1, 0, 2))
+        llr_c2 = llr_c1.reshape((-1, llr_c1.shape[-1]))[:, :n]
+    elif arch == 'vert':
+        fit2x = Nt * np.log2(M) / n
+        if int(fit2x) >= 1:
+            llr_c0 = llr_c.reshape((llr_c.shape[0], -1))
+            llr_c1 = llr_c0[:, :int(
+                llr_c0.shape[-1] - np.mod(llr_c0.shape[-1], n))]
+            llr_c2 = llr_c1.reshape((-1, n))
+        else:
+            llr_c1 = llr_c.reshape(
+                (-1, int(Nt * np.log2(M) * np.ceil(1 / fit2x))))
+            llr_c2 = llr_c1[:, :n]
+    else:
+        print('Architecture not available.')
+    return llr_c2
+
+
+def gpu_select(number=0, memory_growth=True, cpus=0):
+    '''Select/deactivate GPU in Tensorflow 2
+    Configure to use only a single GPU and allocate only as much memory as needed
+    For more details, see https://www.tensorflow.org/guide/gpu
+    '''
+    if number >= 0:
+        # Choose GPU
+        gpus = tf.config.list_physical_devices('GPU')
+        print('Number of GPUs available :', len(gpus))
+        if gpus:
+            gpu_number = number  # Index of the GPU to use
+            try:
+                tf.config.set_visible_devices(gpus[gpu_number], 'GPU')
+                print('Only GPU number', gpu_number, 'used.')
+                tf.config.experimental.set_memory_growth(
+                    gpus[gpu_number], memory_growth)
+            except RuntimeError as error:
+                print(error)
+    elif number == -1:
+        # Deactivate GPUs and use CPUs
+        try:
+            tf.config.experimental.set_visible_devices([], 'GPU')
+            print('GPUs deactivated.')
+        except RuntimeError as error:
+            print(error)
+        if cpus > 0:
+            try:
+                tf.config.threading.set_intra_op_parallelism_threads(cpus)
+                tf.config.threading.set_inter_op_parallelism_threads(1)
+                print(cpus, 'CPUs used.')
+            except RuntimeError as error:
+                print(error)
+    else:
+        print('Will choose GPU or CPU automatically.')
+
+# ------ Legacy ---------------------------
+
+
+class cmdnet_bin2(tf.keras.Model):
+    '''Binary CMDNet layer
+    '''
+
+    def __init__(self, it, m, alpha, taui0=1, delta0=1):
+        super(cmdnet_bin2, self).__init__()
+        self.it = tf.constant(it)
+        self.m = m
+        self.M = m.shape[0]
+        # if (m == np.array([-1, 1])).all():
+        alpha = alpha[:, 0]
+        # else:
+        #    alpha = alpha[:, 1]
+        self.alphat = tf.constant(value=alpha)
+        # func_tau = tau0 * np.ones(self.it + 1)
+        self.taui = self.add_weight(shape=(it + 1,),
+                                    initializer=tf.keras.initializers.Constant(
+                                        value=taui0),
+                                    trainable=True)
+        self.delta = self.add_weight(shape=(it,),
+                                     initializer=tf.keras.initializers.Constant(
+                                         value=delta0),
+                                     trainable=True)
+        self.s0 = tf.constant(value=np.zeros_like(alpha))
+        # self.G0 = self.add_weight(shape = alpha.shape,
+        #                      initializer=tf.keras.initializers.Constant(value = np.zeros_like(alpha)),
+        #                      trainable=False)
+        # self.taui = tf.Variable(initial_value = 1 / func_tau,
+        #                         trainable = True)
+        # self.delta = tf.Variable(initial_value = delta0 * np.ones(it),
+        #                          trainable = True)
+        # b_init = tf.zeros_initializer()
+        # self.b = tf.Variable(initial_value=b_init(shape=(units,),
+        #                                          dtype='float32'),
+        #                     trainable=True)
+
+    # @tf.function#(jit_compile = True)
+    def call(self, inputs):
+        [yt, Ht, sigmat0] = inputs
+        sigmat = tf.expand_dims(sigmat0, axis=-1)
+
+        alphat = self.alphat
+        s = KB.transpose(KB.expand_dims(self.s0)) * KB.ones_like(Ht[:, 0, :])
+        taui_abs = KB.abs(self.taui[0])
+        xt = KB.tanh((KB.log(1 / alphat - 1) + s) / 2 * taui_abs)
+
+        # UNFOLDING
+        HH = KB.batch_dot(KB.permute_dimensions(Ht, (0, 2, 1)), Ht)
+        yH = KB.batch_dot(yt, Ht)
+        # HTy = tf.squeeze(tf.matmul(tf.transpose(Ht, [0, 2, 1]), tf.expand_dims(yt, axis = -1)), axis = -1)
+        # HTH = tf.matmul(tf.transpose(Ht, [0, 2, 1]), Ht)
+        for iteration in tf.range(0, self.it):
+            xHH = KB.batch_dot(xt, HH)
+            grad_x = 1 / 2 * taui_abs * (1 - xt ** 2)
+            grad_L = sigmat ** 2 * KB.tanh(s / 2) + grad_x * (xHH - yH)
+            # grad_L = KB.tanh(s / 2) + 1 / sigmat ** 2 * grad_x * (xHH - yH) # original version
+            # Gradient/ResNet Layer
+            s = s - self.delta[iteration] * grad_L
+
+            # Start of new iteration
+            # no negative values for tau !
+            taui_abs = KB.abs(self.taui[iteration + 1])
+            xt = KB.tanh((KB.log(1 / alphat - 1) + s) / 2 * taui_abs)
+            xt2 = KB.expand_dims(xt, axis=-1)
+            # [q(x = m_1), q(x = m_2)]
+            ft = tf.concat([(1 + self.m[0] * xt2) / 2,
+                           (1 + self.m[1] * xt2) / 2], axis=-1)
+        return ft, xt
