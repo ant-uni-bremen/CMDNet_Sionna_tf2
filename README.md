@@ -1,4 +1,6 @@
 # CMDNet for Sionna and TensorFlow 2: Concrete MAP Detection Network
+[![DOI](https://zenodo.org/badge/523283602.svg)](https://doi.org/10.5281/zenodo.17986813)
+
 CMDNet implementation for Soft MIMO Detection in Nvidia's Sionna library and TensorFlow 2.
 
 This new CMDNet version is adapted for TensorFlow 2, as the original source code [1] has been implemented in TensorFlow 1.15. Furthermore, we implemented CMDNet for Sionna using Keras as an agnostic backend to make it widely applicable for communication engineers. This repository also includes the Approximate Message Passing (AMP) algorithm.
