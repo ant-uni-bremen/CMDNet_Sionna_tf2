@@ -31,7 +31,7 @@ However, CMDNet and LMMSE with the 128x64 LDPC channel code perform better in th
 We implemented CMDNet for
 - Sionna 0.9.0
 - TensorFlow 2.6.0
-- The Conda environment can be found in `sionna.yml`.
+- The Conda environment can be found in `conda_env_sionna.yml`.
 
 Changes may be required for the newest Sionna version, but the code is Keras-native and adaptation may be straightforward.
 
