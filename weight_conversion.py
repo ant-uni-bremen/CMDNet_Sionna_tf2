@@ -13,12 +13,14 @@ sys.path.append('..')                       # NOQA
 
 import tensorflow as tf
 from sionna.mapping import Constellation
-import my_training as mt
+import my_training_tf1 as mt
 import my_functions as mf
 import cmdnet_layers as cmd_layers
 import cmdnet_utils_original as cmd_utils
 
 GLOBAL_PRECISION = 'float64'
+
+# NOTE: my_training_tf1 and my_functions can be found in CMDNet tensorflow1 implementation
 
 
 def weight_conversion():
@@ -49,7 +51,7 @@ def weight_conversion():
                                   binary=binary, taui0=taui0, delta0=delta0)
     # algo1 = algo_cmdnet(Nit, constellation, num_tx_ant, binary = binary, taui0 = taui0, delta0 = delta0)
     sim_set = {'Mod': mod + str(num_bits_per_symbol), 'Nr': 2 *
-               num_rx_ant, 'Nt':  2 * num_tx_ant, 'L': Nit, }
+               num_rx_ant, 'Nt': 2 * num_tx_ant, 'L': Nit, }
     if GLOBAL_PRECISION == 'float64':
         sub_folder = 'data_MIMO_sionna' + '_float64'
     else:
